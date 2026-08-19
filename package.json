@@ -1,0 +1,27 @@
+{
+  "name": "dsh-admin-panel",
+  "description": "Admin panel — agent tools for user, session, and workspace management in multi-tenant dsh deployments.",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "license": "MIT",
+  "scripts": {
+    "build": "node scripts/clean.mjs && tsc -p tsconfig.build.json && tsdown",
+    "typecheck": "tsc -p tsconfig.build.json --noEmit"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-tools": ">=0.0.1-rc.0",
+    "@deepseek-ai/dsh-system-prompt": ">=0.0.1-rc.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-tools": ">=0.0.1-rc.0",
+    "@deepseek-ai/dsh-system-prompt": ">=0.0.1-rc.0",
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "tsdown": "^0.22.0",
+    "typescript": "^6.0.0"
+  }
+}

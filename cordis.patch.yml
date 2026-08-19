@@ -1,0 +1,24 @@
+# Admin panel bundle: inserts management tools (user, session, workspace)
+# for the admin instance. Only mount on the admin instance — never on tenant.
+#
+# Configuration:
+#   keycloakUrl:     Keycloak base URL (e.g. https://auth.example.com:50443)
+#   keycloakRealm:   Keycloak realm name (e.g. martini)
+#   tenantHome:      Path to the tenant DSH_HOME (for session/workspace inspection)
+#   workspaceRoot:   Path to the shared workspace root (e.g. /home/user/dsh-projects)
+#
+# Credentials are read from environment. Put these in the admin instance's
+# .credentials.yaml or environment:
+#   KEYCLOAK_ADMIN_USERNAME: admin
+#   KEYCLOAK_ADMIN_PASSWORD: <password>
+#
+- insert:
+    - id: admin-panel
+      name: '@deepseek-ai/dsh-admin-panel'
+      config:
+        keycloakUrl: !!js process.env.DSH_ADMIN_KEYCLOAK_URL ?? ''
+        keycloakRealm: !!js process.env.DSH_ADMIN_KEYCLOAK_REALM ?? 'master'
+        tenantHome: !!js process.env.DSH_ADMIN_TENANT_HOME ?? ''
+        workspaceRoot: !!js process.env.DSH_ADMIN_WORKSPACE_ROOT ?? ''
+        adminUsername: !!js process.env.KEYCLOAK_ADMIN_USERNAME ?? ''
+        adminPassword: !!js process.env.KEYCLOAK_ADMIN_PASSWORD ?? ''
