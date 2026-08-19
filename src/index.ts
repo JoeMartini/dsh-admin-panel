@@ -58,9 +58,20 @@ You have access to admin tools for multi-tenant management:
 - \`admin_session_list\`: List all tenant sessions across workspaces
 - \`admin_workspace_list\`: List all user workspace directories with session counts
 
+**Privilege Operations** (admin acts on behalf of tenants):
+- \`admin_privilege_exec\`: Run a shell command in a tenant's workspace directory (unrestricted — no sandbox). Use for installing packages, running builds, or any operation the tenant cannot do themselves.
+- \`admin_privilege_copy\`: Copy a file or directory from any source path to any destination. Use to place files into a tenant's workspace from outside the sandbox.
+- \`admin_privilege_chown\`: Change ownership of files in a tenant's workspace so the tenant can access them.
+
 When a user asks to manage users or check tenant status, use these tools.
 User workspace directories follow the pattern: <workspaceRoot>/<username>/.
 New users automatically get a workspace directory created at this path.
+
+**Privilege escalation guidelines:**
+- Always resolve the tenant's workspace path via admin_workspace_list first.
+- Execute privilege commands with the tenant's username as context.
+- After privilege_exec or privilege_copy, verify the result landed in the tenant's workspace.
+- Never use privilege tools to modify the admin instance itself.
 `
 
 /**
@@ -411,6 +422,171 @@ export function apply(ctx: Context, config: Config): void {
           totalSizeKb: Math.round(w.totalSize / 1024),
         })),
       }
+    },
+  }))
+
+  // ── admin_privilege_exec ──
+  ctx.tools.register(defineTool({
+    name: 'admin_privilege_exec',
+    description:
+      'Run a shell command in a tenant\'s workspace directory with admin privileges (no sandbox). '
+      + 'Use for installing packages, running builds, or any operation the tenant cannot do themselves. '
+      + 'The command runs via `bash -c <command>` with cwd set to <workspaceRoot>/<username>/.',
+    parameters: {
+      username: { type: 'string', required: true, description: 'Tenant username whose workspace to act in.' },
+      command: { type: 'string', required: true, description: 'Shell command to execute.' },
+      timeout: { type: 'integer', description: 'Timeout in milliseconds (default 60000, max 300000).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          username: { type: 'string', required: true },
+          cwd: { type: 'string', required: true },
+          exitCode: { type: 'integer', required: true },
+          stdout: { type: 'string', required: true },
+          stderr: { type: 'string', required: true },
+          durationMs: { type: 'integer', required: true },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: `Command finished (exit ${value.exitCode}) in ${value.cwd} (${value.durationMs}ms):\nstdout:\n${value.stdout}\nstderr:\n${value.stderr}`,
+      }],
+    },
+    async execute(args) {
+      const path = await import('node:path')
+      const { execFile } = await import('node:child_process')
+      const cwd = path.join(config.workspaceRoot, args.username)
+      const timeout = Math.min(args.timeout ?? 60000, 300000)
+      const start = Date.now()
+      return new Promise((resolve) => {
+        execFile('bash', ['-c', args.command], { cwd, timeout, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+          const durationMs = Date.now() - start
+          resolve({
+            username: args.username,
+            cwd,
+            exitCode: err ? (typeof err.code === 'number' ? err.code : -1) : 0,
+            stdout: (stdout ?? '').slice(0, 50000),
+            stderr: (stderr ?? '').slice(0, 50000),
+            durationMs,
+          })
+        })
+      })
+    },
+  }))
+
+  // ── admin_privilege_copy ──
+  ctx.tools.register(defineTool({
+    name: 'admin_privilege_copy',
+    description:
+      'Copy a file or directory from any source path to any destination. Use to place files '
+      + 'into a tenant\'s workspace from outside the sandbox. Runs `cp -v [-r] <source> <destination>`.',
+    parameters: {
+      source: { type: 'string', required: true, description: 'Source file or directory path.' },
+      destination: { type: 'string', required: true, description: 'Destination path.' },
+      recursive: { type: 'boolean', description: 'Copy directories recursively (default true).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          source: { type: 'string', required: true },
+          destination: { type: 'string', required: true },
+          copied: { type: 'boolean', required: true },
+          detail: { type: 'string', required: true },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.copied
+          ? `Copied ${value.source} → ${value.destination}.\n${value.detail}`
+          : `Copy failed: ${value.source} → ${value.destination}. ${value.detail}`,
+      }],
+    },
+    async execute(args) {
+      const { execFile } = await import('node:child_process')
+      const recursive = args.recursive ?? true
+      const cpArgs = ['-v']
+      if (recursive) cpArgs.push('-r')
+      cpArgs.push(args.source, args.destination)
+      return new Promise((resolve) => {
+        execFile('cp', cpArgs, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+          if (err) {
+            resolve({
+              source: args.source,
+              destination: args.destination,
+              copied: false,
+              detail: (err.message || '') + (stderr ? `\n${stderr}` : ''),
+            })
+          } else {
+            resolve({
+              source: args.source,
+              destination: args.destination,
+              copied: true,
+              detail: (stdout ?? '').trim() || 'OK',
+            })
+          }
+        })
+      })
+    },
+  }))
+
+  // ── admin_privilege_chown ──
+  ctx.tools.register(defineTool({
+    name: 'admin_privilege_chown',
+    description:
+      'Change ownership of files in a tenant\'s workspace so the tenant can access them. '
+      + 'Runs `sudo chown -R <owner> <path>`. If path is omitted, defaults to <workspaceRoot>/<username>/.',
+    parameters: {
+      username: { type: 'string', required: true, description: 'Tenant username (owner to set).' },
+      path: { type: 'string', description: 'Path to chown (defaults to <workspaceRoot>/<username>).' },
+      group: { type: 'string', description: 'Group to set (e.g. <username> or a shared group).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          username: { type: 'string', required: true },
+          path: { type: 'string', required: true },
+          chowned: { type: 'boolean', required: true },
+          detail: { type: 'string', required: true },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.chowned
+          ? `Chowned ${value.path} to ${value.username}.\n${value.detail}`
+          : `Chown failed for ${value.path}: ${value.detail}`,
+      }],
+    },
+    async execute(args) {
+      const nodePath = await import('node:path')
+      const { execFile } = await import('node:child_process')
+      const targetPath = args.path ?? nodePath.join(config.workspaceRoot, args.username)
+      const owner = args.group ? `${args.username}:${args.group}` : args.username
+      return new Promise((resolve) => {
+        execFile('sudo', ['chown', '-R', owner, targetPath], { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+          if (err) {
+            resolve({
+              username: args.username,
+              path: targetPath,
+              chowned: false,
+              detail: (err.message || '') + (stderr ? `\n${stderr}` : ''),
+            })
+          } else {
+            resolve({
+              username: args.username,
+              path: targetPath,
+              chowned: true,
+              detail: (stdout ?? '').trim() || 'OK',
+            })
+          }
+        })
+      })
     },
   }))
 }
