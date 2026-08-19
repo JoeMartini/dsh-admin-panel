@@ -2,8 +2,9 @@
  * Admin Panel — agent tools for multi-tenant dsh management.
  *
  * Registers tools that let the admin agent manage users (via Keycloak Admin
- * API), inspect tenant sessions, and view workspace directories. Only mount
- * on the admin instance.
+ * API), inspect tenant sessions, and perform privilege escalation on behalf
+ * of tenants (unrestricted shell, file copy, ownership fix). Only mount on the
+ * admin instance.
  *
  * @module @deepseek-ai/dsh-admin-panel
  */
@@ -73,6 +74,48 @@ New users automatically get a workspace directory created at this path.
 - After privilege_exec or privilege_copy, verify the result landed in the tenant's workspace.
 - Never use privilege tools to modify the admin instance itself.
 `
+
+// ─────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────
+
+/** Reject usernames that could be path traversal or shell injection vectors. */
+const SAFE_USERNAME = /^[a-zA-Z0-9_-]+$/
+
+/** Assert a username is safe for filesystem path construction. */
+function validateUsername(username: string): void {
+  if (!SAFE_USERNAME.test(username)) {
+    throw new Error(`Invalid username: "${username}" — only alphanumeric, hyphen, and underscore are allowed.`)
+  }
+}
+
+/**
+ * Resolve a tenant workspace path and verify it is under the workspace root.
+ * Prevents path traversal (e.g. username = "../etc") and symlink escapes.
+ */
+async function resolveTenantPath(workspaceRoot: string, username: string, subPath?: string): Promise<string> {
+  const path = await import('node:path')
+  const fs = await import('node:fs/promises')
+  const cwd = path.resolve(workspaceRoot, username, subPath ?? '')
+  const realWorkspaceRoot = await fs.realpath(workspaceRoot).catch(() => workspaceRoot)
+  const realCwd = await fs.realpath(cwd).catch(() => cwd)
+  if (!realCwd.startsWith(realWorkspaceRoot + path.sep) && realCwd !== realWorkspaceRoot) {
+    throw new Error(`Resolved path "${realCwd}" is outside workspace root "${realWorkspaceRoot}"`)
+  }
+  return cwd
+}
+
+/** Ensure a directory exists, creating it if necessary. */
+async function ensureDir(dirPath: string): Promise<void> {
+  const fs = await import('node:fs/promises')
+  await fs.mkdir(dirPath, { recursive: true })
+}
+
+/** Truncate stdout/stderr to a reasonable size for tool output. */
+const MAX_OUTPUT = 50_000
+function truncate(s: string): string {
+  return s.slice(0, MAX_OUTPUT)
+}
 
 /**
  * Register admin management tools on the tool registry.
@@ -184,6 +227,7 @@ export function apply(ctx: Context, config: Config): void {
       }],
     },
     async execute(args) {
+      validateUsername(args.username)
       const createInput: { username: string; password: string; enabled: boolean; temporaryPassword: boolean; email?: string; firstName?: string; lastName?: string } = {
         username: args.username,
         password: args.password,
@@ -205,10 +249,9 @@ export function apply(ctx: Context, config: Config): void {
         }
       }
       // Create workspace directory
-      const fs = await import('node:fs/promises')
       const path = await import('node:path')
       const workspacePath = path.join(config.workspaceRoot, args.username)
-      await fs.mkdir(workspacePath, { recursive: true })
+      await ensureDir(workspacePath)
       return { userId, username: args.username, workspacePath, rolesAssigned }
     },
   }))
@@ -431,7 +474,8 @@ export function apply(ctx: Context, config: Config): void {
     description:
       'Run a shell command in a tenant\'s workspace directory with admin privileges (no sandbox). '
       + 'Use for installing packages, running builds, or any operation the tenant cannot do themselves. '
-      + 'The command runs via `bash -c <command>` with cwd set to <workspaceRoot>/<username>/.',
+      + 'The command runs via `bash -c <command>` with cwd set to <workspaceRoot>/<username>/. '
+      + 'The workspace directory is created if it does not exist.',
     parameters: {
       username: { type: 'string', required: true, description: 'Tenant username whose workspace to act in.' },
       command: { type: 'string', required: true, description: 'Shell command to execute.' },
@@ -456,9 +500,10 @@ export function apply(ctx: Context, config: Config): void {
       }],
     },
     async execute(args) {
-      const path = await import('node:path')
+      validateUsername(args.username)
+      const cwd = await resolveTenantPath(config.workspaceRoot, args.username)
+      await ensureDir(cwd)
       const { execFile } = await import('node:child_process')
-      const cwd = path.join(config.workspaceRoot, args.username)
       const timeout = Math.min(args.timeout ?? 60000, 300000)
       const start = Date.now()
       return new Promise((resolve) => {
@@ -468,8 +513,8 @@ export function apply(ctx: Context, config: Config): void {
             username: args.username,
             cwd,
             exitCode: err ? (typeof err.code === 'number' ? err.code : -1) : 0,
-            stdout: (stdout ?? '').slice(0, 50000),
-            stderr: (stderr ?? '').slice(0, 50000),
+            stdout: truncate(stdout ?? ''),
+            stderr: truncate(stderr ?? ''),
             durationMs,
           })
         })
@@ -519,14 +564,14 @@ export function apply(ctx: Context, config: Config): void {
               source: args.source,
               destination: args.destination,
               copied: false,
-              detail: (err.message || '') + (stderr ? `\n${stderr}` : ''),
+              detail: truncate((err.message || '') + (stderr ? `\n${stderr}` : '')),
             })
           } else {
             resolve({
               source: args.source,
               destination: args.destination,
               copied: true,
-              detail: (stdout ?? '').trim() || 'OK',
+              detail: truncate((stdout ?? '').trim() || 'OK'),
             })
           }
         })
@@ -539,7 +584,8 @@ export function apply(ctx: Context, config: Config): void {
     name: 'admin_privilege_chown',
     description:
       'Change ownership of files in a tenant\'s workspace so the tenant can access them. '
-      + 'Runs `sudo chown -R <owner> <path>`. If path is omitted, defaults to <workspaceRoot>/<username>/.',
+      + 'Runs `sudo chown -R <owner> <path>`. If path is omitted, defaults to <workspaceRoot>/<username>/. '
+      + 'The target path must resolve under the workspace root.',
     parameters: {
       username: { type: 'string', required: true, description: 'Tenant username (owner to set).' },
       path: { type: 'string', description: 'Path to chown (defaults to <workspaceRoot>/<username>).' },
@@ -564,10 +610,19 @@ export function apply(ctx: Context, config: Config): void {
       }],
     },
     async execute(args) {
-      const nodePath = await import('node:path')
-      const { execFile } = await import('node:child_process')
-      const targetPath = args.path ?? nodePath.join(config.workspaceRoot, args.username)
+      validateUsername(args.username)
+      // Resolve default path or validate custom path is under workspace root
+      const path = await import('node:path')
+      const fs = await import('node:fs/promises')
+      const targetPath = args.path ?? path.join(config.workspaceRoot, args.username)
+      // Canonicalize and verify containment
+      const realWorkspaceRoot = await fs.realpath(config.workspaceRoot).catch(() => config.workspaceRoot)
+      const realTarget = await fs.realpath(targetPath).catch(() => targetPath)
+      if (!realTarget.startsWith(realWorkspaceRoot + path.sep) && realTarget !== realWorkspaceRoot) {
+        throw new Error(`Target path "${realTarget}" is outside workspace root "${realWorkspaceRoot}"`)
+      }
       const owner = args.group ? `${args.username}:${args.group}` : args.username
+      const { execFile } = await import('node:child_process')
       return new Promise((resolve) => {
         execFile('sudo', ['chown', '-R', owner, targetPath], { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
           if (err) {
@@ -575,14 +630,14 @@ export function apply(ctx: Context, config: Config): void {
               username: args.username,
               path: targetPath,
               chowned: false,
-              detail: (err.message || '') + (stderr ? `\n${stderr}` : ''),
+              detail: truncate((err.message || '') + (stderr ? `\n${stderr}` : '')),
             })
           } else {
             resolve({
               username: args.username,
               path: targetPath,
               chowned: true,
-              detail: (stdout ?? '').trim() || 'OK',
+              detail: truncate((stdout ?? '').trim() || 'OK'),
             })
           }
         })
