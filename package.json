@@ -7,6 +7,11 @@
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
   "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "scripts": {
     "build": "node scripts/clean.mjs && tsc -p tsconfig.build.json && tsdown",
     "typecheck": "tsc -p tsconfig.build.json --noEmit"
